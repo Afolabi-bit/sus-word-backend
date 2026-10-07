@@ -39,6 +39,7 @@ type PublicRoomState struct {
 	EliminationLog []EliminationRecord `json:"eliminationLog"`
 	LastEliminated *EliminationRecord  `json:"lastEliminated"`
 	Winner         *string             `json:"winner"`
+	VotedPlayerIDs []string            `json:"votedPlayerIds"`
 }
 
 // BasePlayer stores player state common to game logic.
@@ -82,6 +83,7 @@ type RoomData struct {
 	TimerEndsAt     *time.Time             `json:"timerEndsAt"`
 	RevealOrder     []string               `json:"revealOrder"`
 	RevealIndex     int                    `json:"revealIndex"`
+	Votes           map[string]string      `json:"-"` // voterID -> targetID
 	WordHistory     map[string]bool        `json:"-"`
 	CreatedAt       time.Time              `json:"createdAt"`
 }
@@ -107,6 +109,11 @@ func (r *RoomData) ToPublic() PublicRoomState {
 	eliminationLogCopy := make([]EliminationRecord, len(r.EliminationLog))
 	copy(eliminationLogCopy, r.EliminationLog)
 
+	votedPlayerIDs := make([]string, 0, len(r.Votes))
+	for vid := range r.Votes {
+		votedPlayerIDs = append(votedPlayerIDs, vid)
+	}
+
 	return PublicRoomState{
 		RoomCode:       r.Code,
 		Phase:          r.Phase,
@@ -117,6 +124,7 @@ func (r *RoomData) ToPublic() PublicRoomState {
 		EliminationLog: eliminationLogCopy,
 		LastEliminated: r.LastEliminated,
 		Winner:         winnerPtr,
+		VotedPlayerIDs: votedPlayerIDs,
 	}
 }
 
