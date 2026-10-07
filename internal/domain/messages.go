@@ -21,6 +21,7 @@ const (
 	MsgTypeStartDiscussion = "START_DISCUSSION"
 	MsgTypeEndDiscussion   = "END_DISCUSSION"
 	MsgTypeEliminatePlayer = "ELIMINATE_PLAYER"
+	MsgTypeCastVote        = "CAST_VOTE"
 	MsgTypeNextRound       = "NEXT_ROUND"
 	MsgTypePlayAgain       = "PLAY_AGAIN"
 	MsgTypeNewGame         = "NEW_GAME"
@@ -34,6 +35,8 @@ const (
 	MsgTypeRevealTurn        = "REVEAL_TURN"
 	MsgTypeDiscussionStarted = "DISCUSSION_STARTED"
 	MsgTypeDiscussionEnded   = "DISCUSSION_ENDED"
+	MsgTypeVoteCast          = "VOTE_CAST"
+	MsgTypeVotingResults     = "VOTING_RESULTS"
 	MsgTypePlayerEliminated  = "PLAYER_ELIMINATED"
 	MsgTypeGameOver          = "GAME_OVER"
 	MsgTypePlayerJoined      = "PLAYER_JOINED"
@@ -71,6 +74,23 @@ type SetTimerPayload struct {
 
 type EliminatePlayerPayload struct {
 	PlayerID string `json:"playerId"`
+}
+
+type CastVotePayload struct {
+	TargetPlayerID string `json:"targetPlayerId"`
+}
+
+type VoteCastPayload struct {
+	VoterID       string `json:"voterId"`
+	TotalVotes    int    `json:"totalVotes"`
+	TotalExpected int    `json:"totalExpected"`
+}
+
+type VotingResultsPayload struct {
+	Tally        map[string]int    `json:"tally"`
+	Votes        map[string]string `json:"votes,omitempty"`
+	EliminatedID string            `json:"eliminatedId,omitempty"`
+	IsTie        bool              `json:"isTie"`
 }
 
 // Server Payloads
