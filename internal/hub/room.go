@@ -335,6 +335,9 @@ func (r *Room) handleAction(p *player.Player, env domain.Envelope) {
 	case domain.MsgTypeEliminatePlayer:
 		r.handleEliminatePlayer(p, env.Payload, reqID)
 
+	case domain.MsgTypeCastVote:
+		r.handleCastVote(p, env.Payload, reqID)
+
 	case domain.MsgTypeNextRound:
 		r.handleNextRound(p, reqID)
 
@@ -541,6 +544,98 @@ func (r *Room) handleEliminatePlayer(p *player.Player, payloadRaw json.RawMessag
 			SecretWord:     r.state.SecretWord,
 			EliminationLog: r.state.EliminationLog,
 		})
+	}
+
+	r.broadcastRoomState()
+}
+
+func (r *Room) handleCastVote(p *player.Player, payloadRaw json.RawMessage, reqID string) {
+	var payload domain.CastVotePayload
+	if err := json.Unmarshal(payloadRaw, &payload); err != nil {
+		p.RecordError()
+		r.sendError(p, domain.ErrCodeInvalidPayload, "Invalid cast vote payload", reqID)
+		return
+	}
+
+	allVoted, err := r.state.CastVote(p.ID, payload.TargetPlayerID)
+	if err != nil {
+		p.RecordError()
+		r.sendError(p, domain.ErrCodeInvalidTarget, err.Error(), reqID)
+		return
+	}
+
+	p.RecordSuccess()
+
+	// Broadcast VOTE_CAST progress to all players (without revealing target)
+	r.broadcast(domain.MsgTypeVoteCast, domain.VoteCastPayload{
+		VoterID:       p.ID,
+		TotalVotes:    len(r.state.Votes),
+		TotalExpected: len(r.state.ActivePlayerIDs),
+	})
+	r.broadcastRoomState()
+
+	// If all active players have cast their ballots, finalize voting automatically
+	if allVoted {
+		r.finalizeVoting()
+	}
+}
+
+func (r *Room) finalizeVoting() {
+	if r.state.Phase != domain.PhaseVoting {
+		return
+	}
+
+	winnerID, isTie, tally := r.state.TallyVotes()
+
+	// Prepare votes breakdown map (voterName -> targetName) for reveal
+	voteBreakdown := make(map[string]string)
+	for voterID, targetID := range r.state.Votes {
+		voterName := voterID
+		if vp, ok := r.state.Players[voterID]; ok {
+			voterName = vp.DisplayName
+		}
+		targetName := targetID
+		if tp, ok := r.state.Players[targetID]; ok {
+			targetName = tp.DisplayName
+		}
+		voteBreakdown[voterName] = targetName
+	}
+
+	r.broadcast(domain.MsgTypeVotingResults, domain.VotingResultsPayload{
+		Tally:        tally,
+		Votes:        voteBreakdown,
+		EliminatedID: winnerID,
+		IsTie:        isTie,
+	})
+
+	if winnerID != "" && !isTie {
+		record, gameOver, err := r.state.EliminatePlayer(winnerID)
+		if err == nil {
+			r.broadcast(domain.MsgTypePlayerEliminated, domain.PlayerEliminatedPayload{
+				PlayerID:      record.PlayerID,
+				DisplayName:   record.DisplayName,
+				WasImposter:   record.WasImposter,
+				ActivePlayers: r.state.ActivePlayerIDs,
+				Phase:         r.state.Phase,
+			})
+
+			if gameOver {
+				imposterName := ""
+				if imposterBase, ok := r.state.Players[r.state.ImposterID]; ok {
+					imposterName = imposterBase.DisplayName
+				}
+
+				r.broadcast(domain.MsgTypeGameOver, domain.GameOverPayload{
+					Winner:         r.state.Winner,
+					ImposterName:   imposterName,
+					SecretWord:     r.state.SecretWord,
+					EliminationLog: r.state.EliminationLog,
+				})
+			}
+		}
+	} else if isTie {
+		// On tie, transition to result phase with tie state
+		r.state.Phase = domain.PhaseResult
 	}
 
 	r.broadcastRoomState()
