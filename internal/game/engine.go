@@ -50,6 +50,7 @@ func NewRoomData(code, hostID, hostName string, initialTimer int) *RoomDataWithS
 		ActivePlayerIDs: make([]string, 0),
 		EliminationLog:  make([]domain.EliminationRecord, 0),
 		TimerDuration:   initialTimer,
+		Votes:           make(map[string]string),
 		WordHistory:     make(map[string]bool),
 		CreatedAt:       time.Now(),
 	}
@@ -153,6 +154,7 @@ func (r *RoomDataWithState) StartGame(ws *WordSelector) (map[string]domain.RoleA
 	r.EliminationLog = make([]domain.EliminationRecord, 0)
 	r.LastEliminated = nil
 	r.Winner = ""
+	r.Votes = make(map[string]string)
 	r.Phase = domain.PhaseRevealing
 
 	// 5. Generate private role payloads
@@ -244,8 +246,78 @@ func (r *RoomDataWithState) EndDiscussion() error {
 	}
 
 	r.TimerEndsAt = nil
+	r.Votes = make(map[string]string)
 	r.Phase = domain.PhaseVoting
 	return nil
+}
+
+// CastVote records an individual player's ballot.
+func (r *RoomDataWithState) CastVote(voterID, targetID string) (allVoted bool, err error) {
+	if r.Phase != domain.PhaseVoting {
+		return false, fmt.Errorf("%w: voting only allowed in voting phase", ErrInvalidPhase)
+	}
+
+	// Verify voter is active
+	voterActive := false
+	for _, id := range r.ActivePlayerIDs {
+		if id == voterID {
+			voterActive = true
+			break
+		}
+	}
+	if !voterActive {
+		return false, fmt.Errorf("only active players can vote")
+	}
+
+	// Verify target is active
+	targetActive := false
+	for _, id := range r.ActivePlayerIDs {
+		if id == targetID {
+			targetActive = true
+			break
+		}
+	}
+	if !targetActive {
+		return false, ErrInvalidTarget
+	}
+
+	if r.Votes == nil {
+		r.Votes = make(map[string]string)
+	}
+
+	r.Votes[voterID] = targetID
+	allVoted = len(r.Votes) >= len(r.ActivePlayerIDs)
+	return allVoted, nil
+}
+
+// TallyVotes calculates ballot counts and determines plurality winner.
+func (r *RoomDataWithState) TallyVotes() (winnerID string, isTie bool, tally map[string]int) {
+	tally = make(map[string]int)
+	for _, target := range r.Votes {
+		tally[target]++
+	}
+
+	maxVotes := 0
+	candidates := make([]string, 0)
+	for target, count := range tally {
+		if count > maxVotes {
+			maxVotes = count
+			candidates = []string{target}
+		} else if count == maxVotes {
+			candidates = append(candidates, target)
+		}
+	}
+
+	if len(candidates) == 1 {
+		return candidates[0], false, tally
+	}
+
+	// In case of tie or zero votes, isTie is true
+	if len(candidates) > 1 {
+		return candidates[0], true, tally
+	}
+
+	return "", true, tally
 }
 
 // EliminatePlayer processes an elimination vote, updates history, and evaluates win conditions.
