@@ -1,0 +1,20 @@
+# Binaries
+susword-server
+susword-server.exe
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+
+# Test artifacts
+*.test
+*.out
+
+# Environment variables
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
