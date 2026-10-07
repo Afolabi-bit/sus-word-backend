@@ -1,0 +1,815 @@
+# SusWord Online Multiplayer — Go Backend Specification
+
+**Version**: 1.0  
+**Date**: 2026-10-07  
+**Stack**: Go (server) + Next.js / React (client, existing)  
+**Protocol**: WebSocket (persistent, real-time) over HTTPS  
+**Deployment target**: Single binary, runs behind nginx/Caddy reverse proxy
+
+---
+
+## Table of Contents
+
+1. [Overview & Goals](#1-overview--goals)
+2. [Game Flow Mapping (Offline → Online)](#2-game-flow-mapping)
+3. [Core Data Models](#3-core-data-models)
+4. [WebSocket Protocol](#4-websocket-protocol)
+   - 4.1 Envelope Format
+   - 4.2 Client → Server Messages
+   - 4.3 Server → Client Messages
+5. [Room & Lobby System](#5-room--lobby-system)
+6. [Game State Machine](#6-game-state-machine)
+7. [Security & Anti-Cheat](#7-security--anti-cheat)
+8. [HTTP REST Endpoints](#8-http-rest-endpoints)
+9. [Server Architecture](#9-server-architecture)
+10. [Word List Management](#10-word-list-management)
+11. [Persistence Strategy](#11-persistence-strategy)
+12. [Rate Limiting & Abuse Prevention](#12-rate-limiting--abuse-prevention)
+13. [Deployment Considerations](#13-deployment-considerations)
+14. [Frontend Integration Changes](#14-frontend-integration-changes)
+15. [Open Questions](#15-open-questions)
+
+---
+
+## 1. Overview & Goals
+
+### What "Online" means for SusWord
+
+SusWord's core mechanic requires **stealth role distribution** — each player privately sees their own role screen. In the pass-and-play (offline) mode the phone is physically passed around. Online mode means every player is on their own device; the server must:
+
+- Distribute the secret word to civilians and `"???"` to the imposter **privately per connection**, never broadcasting the word to all.
+- Synchronise the discussion timer across all devices.
+- Orchestrate voting without revealing who voted for whom until submission is confirmed.
+- Support players rejoining mid-session if they lose connectivity.
+
+### Non-Goals (v1)
+
+- Spectator mode
+- Voice/video integration
+- Ranked matchmaking
+- Chat within the app
+- More than one game per room simultaneously
+
+---
+
+## 2. Game Flow Mapping
+
+| Offline Phase | Online Equivalent | Who triggers it |
+|---|---|---|
+| `home` | Player lands on `/online` page, creates or joins a room | Each player independently |
+| `setup` | **Host** configures players, timer, and presses Start | Host only |
+| `revealing` | Server sends each player their private role; client shows reveal screen | Server (pushed per connection) |
+| `ready` | Host confirms all players have seen their word | Last player clicks "Ready" triggers auto-advance |
+| `discussing` | Server-authoritative countdown synced to all | Server broadcasts tick or target timestamp |
+| `voting` | **Host** submits the voted player; server records it | Host only |
+| `result` | Server broadcasts elimination result | Server |
+| `gameOver` | Server broadcasts final result with imposter revealed | Server |
+
+---
+
+## 3. Core Data Models
+
+### 3.1 Player
+
+```go
+type Player struct {
+    ID          string    // UUID v4, assigned on WS connect
+    DisplayName string    // e.g. "Alice"
+    RoomCode    string
+    ConnectedAt time.Time
+    IsHost      bool
+    IsReady     bool      // true once they've tapped through their reveal screen
+    IsActive    bool      // false after elimination; still connected as observer
+    conn        *websocket.Conn
+    send        chan []byte
+}
+```
+
+### 3.2 Room
+
+```go
+type Room struct {
+    Code            string              // 6 uppercase alphanumeric, e.g. "XK92PL"
+    Players         map[string]*Player   // keyed by Player.ID
+    HostID          string
+    Phase           Phase
+    SecretWord      string
+    SecretCategory  string
+    ImposterID      string
+    ActivePlayerIDs []string           // ordered; shrinks as eliminations occur
+    EliminationLog  []EliminationRecord
+    LastEliminated  *EliminationRecord
+    Winner          string              // "civilians" | "imposter" | ""
+    TimerDuration   int                 // seconds
+    TimerEndsAt     *time.Time          // nil until discussion starts; authoritative
+    RevealOrder     []string            // PlayerIDs in reveal sequence
+    RevealIndex     int                 // index into RevealOrder
+    WordHistory     map[string]bool     // recent words, to avoid repeats
+    CreatedAt       time.Time
+    mu              sync.RWMutex
+}
+```
+
+### 3.3 Phase (mirrors the offline store)
+
+```go
+type Phase string
+
+const (
+    PhaseLobby      Phase = "lobby"      // players joining, host configuring
+    PhaseRevealing  Phase = "revealing"  // private role reveal in progress
+    PhaseReady      Phase = "ready"      // everyone has seen; host starts timer
+    PhaseDiscussing Phase = "discussing" // timer running, open debate
+    PhaseVoting     Phase = "voting"     // discussion ended, host picks target
+    PhaseResult     Phase = "result"     // elimination announced
+    PhaseGameOver   Phase = "gameOver"   // winner determined
+)
+```
+
+### 3.4 EliminationRecord
+
+```go
+type EliminationRecord struct {
+    PlayerID    string `json:"playerId"`
+    DisplayName string `json:"displayName"`
+    WasImposter bool   `json:"wasImposter"`
+    RoundNumber int    `json:"round"`
+}
+```
+
+### 3.5 WordEntry
+
+```go
+type WordEntry struct {
+    Word     string `json:"word"`
+    Category string `json:"category"`
+}
+```
+
+---
+
+## 4. WebSocket Protocol
+
+### 4.1 Envelope Format
+
+All messages in both directions use a flat JSON envelope:
+
+```json
+{
+  "type": "MESSAGE_TYPE",
+  "payload": { ... }
+}
+```
+
+- `type` is a `SCREAMING_SNAKE_CASE` string constant.
+- `payload` is message-specific; omitted or `null` for events with no data.
+- The server always echoes the client's `requestId` (if provided) in its response for request-response correlation.
+
+### 4.2 Client → Server Messages
+
+#### `JOIN_ROOM`
+Player joins an existing room by code.
+```json
+{
+  "type": "JOIN_ROOM",
+  "payload": {
+    "roomCode": "XK92PL",
+    "displayName": "Alice"
+  }
+}
+```
+
+#### `SET_TIMER`
+Host sets the discussion timer duration (seconds). Valid values: 60, 120, 180, 300, 600.
+```json
+{
+  "type": "SET_TIMER",
+  "payload": { "seconds": 300 }
+}
+```
+
+#### `START_GAME`
+Host starts the game. Server validates: 4–10 players, all connected.
+```json
+{ "type": "START_GAME" }
+```
+
+#### `PLAYER_READY`
+Player signals they have finished their reveal screen.
+```json
+{ "type": "PLAYER_READY" }
+```
+
+#### `START_DISCUSSION`
+Host triggers the discussion phase (after all players are ready).
+```json
+{ "type": "START_DISCUSSION" }
+```
+
+#### `ELIMINATE_PLAYER`
+Host submits the voted player for elimination.
+```json
+{
+  "type": "ELIMINATE_PLAYER",
+  "payload": { "playerId": "uuid-of-target" }
+}
+```
+
+#### `NEXT_ROUND`
+Host continues to the next round after the result screen.
+```json
+{ "type": "NEXT_ROUND" }
+```
+
+#### `PLAY_AGAIN`
+Host restarts with the same player list but a new word and imposter.
+```json
+{ "type": "PLAY_AGAIN" }
+```
+
+#### `NEW_GAME`
+Host resets to lobby (players stay, configuration clears).
+```json
+{ "type": "NEW_GAME" }
+```
+
+#### `PING`
+Keepalive from client. Server responds with `PONG`.
+```json
+{ "type": "PING" }
+```
+
+---
+
+### 4.3 Server → Client Messages
+
+#### `ROOM_STATE`
+Full room snapshot. Sent on join and whenever phase changes.
+
+> ⚠️ **Critical**: `secretWord` and `imposterID` are **never included** in broadcast payloads. They are sent only in targeted `ROLE_ASSIGNED` messages.
+
+```json
+{
+  "type": "ROOM_STATE",
+  "payload": {
+    "roomCode": "XK92PL",
+    "phase": "lobby",
+    "hostId": "uuid",
+    "timerDuration": 300,
+    "players": [
+      { "id": "uuid", "displayName": "Alice", "isHost": true, "isActive": true, "isReady": false }
+    ],
+    "activePlayers": ["uuid1", "uuid2"],
+    "eliminationLog": [],
+    "lastEliminated": null,
+    "winner": null
+  }
+}
+```
+
+#### `ROLE_ASSIGNED`
+Sent **privately** (targeted, not broadcast) to each player once START_GAME is processed. Each connection receives a message tailored to them.
+
+For **civilians**:
+```json
+{
+  "type": "ROLE_ASSIGNED",
+  "payload": {
+    "role": "civilian",
+    "secretWord": "Elephant",
+    "secretCategory": "Animals"
+  }
+}
+```
+
+For **the imposter**:
+```json
+{
+  "type": "ROLE_ASSIGNED",
+  "payload": {
+    "role": "imposter",
+    "secretWord": null,
+    "secretCategory": "Animals"
+  }
+}
+```
+
+> The category is revealed to the imposter so they can give vague clues and fit in.
+
+#### `REVEAL_TURN`
+Tells all clients whose turn it is in the reveal sequence.
+```json
+{
+  "type": "REVEAL_TURN",
+  "payload": {
+    "currentPlayerId": "uuid",
+    "currentPlayerName": "Bob",
+    "revealIndex": 1,
+    "totalPlayers": 5
+  }
+}
+```
+
+#### `DISCUSSION_STARTED`
+Sent when discussion timer begins. Client uses `endsAt` for authoritative countdown.
+```json
+{
+  "type": "DISCUSSION_STARTED",
+  "payload": {
+    "endsAt": "2026-10-07T15:00:00Z",
+    "durationSeconds": 300
+  }
+}
+```
+
+#### `DISCUSSION_ENDED`
+Timer expired server-side. Move to voting.
+```json
+{ "type": "DISCUSSION_ENDED" }
+```
+
+#### `PLAYER_ELIMINATED`
+Broadcast after host submits elimination vote.
+```json
+{
+  "type": "PLAYER_ELIMINATED",
+  "payload": {
+    "playerId": "uuid",
+    "displayName": "Carol",
+    "wasImposter": false,
+    "activePlayers": ["uuid1", "uuid2", "uuid3"],
+    "phase": "result"
+  }
+}
+```
+
+#### `GAME_OVER`
+Sent when the game ends. **This is the only message that reveals the imposter's identity**.
+```json
+{
+  "type": "GAME_OVER",
+  "payload": {
+    "winner": "civilians",
+    "imposterName": "Dave",
+    "secretWord": "Elephant",
+    "eliminationLog": [ ... ]
+  }
+}
+```
+
+#### `PLAYER_JOINED`
+Broadcast when a new player connects to the lobby.
+```json
+{
+  "type": "PLAYER_JOINED",
+  "payload": { "id": "uuid", "displayName": "Eve", "isHost": false }
+}
+```
+
+#### `PLAYER_LEFT`
+Broadcast when a player disconnects. If host disconnects, `newHostId` is set.
+```json
+{
+  "type": "PLAYER_LEFT",
+  "payload": {
+    "playerId": "uuid",
+    "displayName": "Frank",
+    "newHostId": "uuid-of-new-host"
+  }
+}
+```
+
+#### `PLAYER_RECONNECTED`
+Broadcast when a player rejoins after disconnecting mid-game.
+```json
+{
+  "type": "PLAYER_RECONNECTED",
+  "payload": { "playerId": "uuid", "displayName": "Alice" }
+}
+```
+
+#### `ERROR`
+Sent privately to the requesting client for invalid actions.
+```json
+{
+  "type": "ERROR",
+  "payload": {
+    "code": "NOT_HOST",
+    "message": "Only the host can start the game"
+  }
+}
+```
+
+Error codes:
+| Code | Meaning |
+|---|---|
+| `NOT_HOST` | Action requires host privilege |
+| `INVALID_PHASE` | Action not valid in current phase |
+| `ROOM_NOT_FOUND` | Room code does not exist or has expired |
+| `ROOM_FULL` | Room already has 10 players |
+| `GAME_IN_PROGRESS` | Room is already in an active game |
+| `NAME_TAKEN` | Display name already in use in this room |
+| `INVALID_TARGET` | Eliminated or non-existent player targeted |
+| `NOT_YOUR_TURN` | Player acted out of reveal sequence |
+
+#### `PONG`
+Response to client `PING`.
+```json
+{ "type": "PONG" }
+```
+
+---
+
+## 5. Room & Lobby System
+
+### 5.1 Room creation
+- Client calls `POST /api/rooms` (REST) to create a room.
+- Server generates a **6-character uppercase alphanumeric code** (e.g. `XK92PL`), avoiding ambiguous characters: `0`, `O`, `1`, `I`, `L`.
+- Creator's WebSocket is opened immediately after; they are assigned host.
+- Room expires after **30 minutes of inactivity** (no connected players) or **2 hours absolute**.
+
+### 5.2 Joining
+- Client calls `GET /api/rooms/{code}` to validate the room exists and is in `lobby` phase.
+- Then connects to `wss://host/ws?room=XK92PL&name=Alice`.
+- Server assigns a UUID, persists the player, broadcasts `PLAYER_JOINED`.
+
+### 5.3 Host transfer
+- If the host disconnects, server picks the next connected player in join order.
+- Broadcast `PLAYER_LEFT` with `newHostId` set.
+- If no players remain, room enters a 5-minute grace period before deletion.
+
+### 5.4 Reconnection
+- On reconnect, client sends `JOIN_ROOM` with the same display name.
+- Server matches by `(roomCode, displayName)` — if found and game is in progress, player is re-added as the original player. Their private `ROLE_ASSIGNED` is re-sent.
+- If the room has moved to a new phase, full `ROOM_STATE` is sent first.
+
+### 5.5 Room limits
+| Parameter | Value |
+|---|---|
+| Min players to start | 4 |
+| Max players per room | 10 |
+| Max rooms per server | 500 (configurable) |
+| Reconnect grace window | 60 seconds |
+| Room TTL (empty) | 30 minutes |
+| Room TTL (absolute) | 2 hours |
+
+---
+
+## 6. Game State Machine
+
+```
+lobby
+  └─[START_GAME, host, 4-10 players]──▶ revealing
+      └─[all PLAYER_READY received]────▶ ready
+          └─[START_DISCUSSION, host]───▶ discussing
+              └─[timer expires / host]─▶ voting
+                  └─[ELIMINATE_PLAYER]─▶ result ──[NEXT_ROUND]──▶ discussing
+                                      └─▶ gameOver
+```
+
+### State transition guards
+
+| From | Action | Guard |
+|---|---|---|
+| `lobby` | `START_GAME` | isHost && playerCount 4–10 && all connected |
+| `revealing` | `PLAYER_READY` | sender == current reveal player (RevealOrder[RevealIndex]) |
+| `ready` | `START_DISCUSSION` | isHost |
+| `discussing` | `DISCUSSION_ENDED` | server timer fires, or host triggers early |
+| `voting` | `ELIMINATE_PLAYER` | isHost && target is in activePlayers |
+| `result` | `NEXT_ROUND` | isHost |
+| `gameOver` | `PLAY_AGAIN` | isHost |
+| `gameOver` | `NEW_GAME` | isHost |
+
+---
+
+## 7. Security & Anti-Cheat
+
+### 7.1 Role secrecy
+- **Never** broadcast `secretWord` or `imposterID` to the room-wide channel.
+- Server sends `ROLE_ASSIGNED` only to the individual connection.
+- Server enforces that the word/imposter fields are stripped from all `ROOM_STATE` broadcasts.
+
+### 7.2 Action authorization
+- Every action that mutates game state is validated server-side:
+  - Only host can trigger phase transitions and eliminations.
+  - Only the current reveal player can send `PLAYER_READY`.
+  - Eliminated players cannot be targeted again.
+  - Players not in `activePlayers` are ignored.
+
+### 7.3 Reveal order integrity
+- `RevealOrder` is shuffled by the server using `crypto/rand` on `START_GAME`.
+- Clients cannot influence or predict who sees their word next.
+
+### 7.4 Timer authority
+- `TimerEndsAt` is set server-side and broadcast as an absolute UTC timestamp.
+- Clients render countdown as `endsAt - Date.now()`. No client timer is trusted.
+- Server fires a goroutine that calls `END_DISCUSSION` when the clock hits zero, regardless of client state.
+
+### 7.5 Room code entropy
+- Room codes are generated with `crypto/rand`, not `math/rand`.
+- Codes are checked for collision before use.
+
+### 7.6 Connection limits
+- Maximum 10 WebSocket connections per room.
+- Maximum 5 concurrent connections per IP address.
+- Each message must be ≤ 4 KB; oversized frames are rejected and the connection closed.
+
+---
+
+## 8. HTTP REST Endpoints
+
+```
+POST   /api/rooms
+GET    /api/rooms/:code          -- validate room exists, get player list for lobby UI
+GET    /ws?room=CODE&name=NAME   -- WebSocket upgrade
+GET    /api/health               -- server health check
+```
+
+### `POST /api/rooms`
+Request: empty body or `{ "hostName": "Alice" }`.  
+Response:
+```json
+{
+  "roomCode": "XK92PL",
+  "wsUrl": "wss://susword.example.com/ws?room=XK92PL&name=Alice",
+  "expiresAt": "2026-10-07T16:35:00Z"
+}
+```
+
+### `GET /api/rooms/:code`
+Response `200`:
+```json
+{
+  "roomCode": "XK92PL",
+  "phase": "lobby",
+  "playerCount": 3,
+  "maxPlayers": 10,
+  "joinable": true
+}
+```
+Response `404` if room not found.  
+Response `200` with `"joinable": false` if game is in progress.
+
+---
+
+## 9. Server Architecture
+
+### 9.1 Directory layout
+
+```
+susword-server/
+├── cmd/
+│   └── server/
+│       └── main.go
+├── internal/
+│   ├── hub/
+│   │   ├── hub.go           -- registry of all rooms, goroutine-safe
+│   │   └── room.go          -- room state and logic
+│   ├── player/
+│   │   └── player.go        -- player model, read/write pump goroutines
+│   ├── game/
+│   │   ├── state.go         -- phase types, state machine transitions
+│   │   ├── words.go         -- word list + random selection with history
+│   │   └── reveal.go        -- reveal order shuffling
+│   ├── ws/
+│   │   └── handler.go       -- HTTP → WS upgrade, message routing
+│   ├── api/
+│   │   └── handler.go       -- REST endpoints
+│   └── config/
+│       └── config.go        -- environment-based configuration
+├── go.mod
+├── go.sum
+└── Makefile
+```
+
+### 9.2 Concurrency model
+
+```
+HTTP listener
+    │
+    ▼
+ws/handler.go  ──upgrade──▶  Player goroutines (one per connection)
+                                 │  readPump  → parses message → sends to Room.inbound chan
+                                 │  writePump ← receives from Player.send chan → writes WS frame
+                                 ▼
+                             Room.run() goroutine (one per room)
+                                 │  reads from inbound chan
+                                 │  calls state machine transition
+                                 │  broadcasts to all Player.send chans
+                                 ▼
+                             Hub (registry)
+                                 │  thread-safe map[roomCode]*Room
+                                 │  cleanup goroutine (TTL enforcement)
+```
+
+Each room owns exactly one goroutine. All mutations to room state happen in that goroutine — no locks needed on room state itself. The hub uses `sync.RWMutex` only for the room map.
+
+### 9.3 Key dependencies
+
+| Package | Purpose |
+|---|---|
+| `github.com/gorilla/websocket` | WebSocket implementation |
+| `github.com/go-chi/chi/v5` | HTTP router |
+| `github.com/google/uuid` | UUID v4 generation |
+| `golang.org/x/time/rate` | Per-IP rate limiting |
+| Standard `crypto/rand` | Room code and shuffle entropy |
+| Standard `encoding/json` | Message serialization |
+| Standard `log/slog` | Structured logging |
+
+### 9.4 Configuration (environment variables)
+
+| Variable | Default | Description |
+|---|---|---|
+| `PORT` | `8080` | HTTP/WS listen port |
+| `ALLOWED_ORIGINS` | `*` | CORS allowed origins (comma-separated) |
+| `MAX_ROOMS` | `500` | Hard cap on concurrent rooms |
+| `ROOM_TTL_MINUTES` | `30` | Empty room expiry (minutes) |
+| `MAX_CONN_PER_IP` | `5` | WebSocket connections per IP |
+| `TLS_CERT_FILE` | — | Path to TLS cert (if not behind proxy) |
+| `TLS_KEY_FILE` | — | Path to TLS key |
+
+---
+
+## 10. Word List Management
+
+- Port `lib/words.ts` to a Go slice of `WordEntry` structs in `internal/game/words.go`.
+- Room-level `WordHistory map[string]bool` tracks the last `floor(N/3)` words used in that room, preventing repeats across `PLAY_AGAIN` rounds.
+- The history is scoped to the room and cleared on `NEW_GAME`.
+- No global shared word history between rooms (avoids race conditions and simplifies scaling).
+- Category is always sent to the imposter (as in the offline version).
+
+---
+
+## 11. Persistence Strategy
+
+**v1: No persistence.** All state lives in-memory. Rooms disappear if the server restarts.
+
+Rationale:
+- SusWord sessions are short (10–40 minutes).
+- The reconnect window (60 seconds) covers transient network drops without needing a database.
+- Adding Redis/Postgres is a natural v2 upgrade path.
+
+**v2 upgrade path** (when needed):
+- Store `Room` structs as JSON in Redis with TTL matching `ROOM_TTL_MINUTES`.
+- Subscribe to `PLAYER_LEFT` events to refresh TTL.
+- Enables horizontal scaling and graceful restarts.
+
+---
+
+## 12. Rate Limiting & Abuse Prevention
+
+| Layer | Limit | Mechanism |
+|---|---|---|
+| Room creation | 10 rooms per IP per hour | `golang.org/x/time/rate` token bucket |
+| WS messages | 20 messages per second per connection | Per-connection token bucket |
+| Oversized messages | > 4 KB rejected | Check in readPump before unmarshal |
+| Invalid action flooding | 10 consecutive errors → disconnect | Error counter per connection |
+| Join attempts | 30 per IP per hour | Token bucket on `/api/rooms/:code` |
+
+---
+
+## 13. Deployment Considerations
+
+### Single binary
+```bash
+go build -o susword-server ./cmd/server
+```
+No runtime dependencies beyond the binary.
+
+### Behind nginx (recommended)
+```nginx
+location /ws {
+    proxy_pass http://localhost:8080;
+    proxy_http_version 1.1;
+    proxy_set_header Upgrade $http_upgrade;
+    proxy_set_header Connection "upgrade";
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_read_timeout 86400s;   # Keep WS connections alive
+}
+location /api {
+    proxy_pass http://localhost:8080;
+    proxy_set_header X-Real-IP $remote_addr;
+}
+```
+
+### Scaling
+- v1: Single instance handles ~500 concurrent rooms comfortably.
+- v2: Add Redis-backed state + sticky sessions or consistent hashing by room code across Go instances.
+
+### Health check
+`GET /api/health` returns `200 {"status": "ok", "rooms": N}`. Use for load balancer probes.
+
+---
+
+## 14. Frontend Integration Changes
+
+The existing Next.js app needs these changes to support online mode:
+
+### 14.1 New route
+Add `/online` page alongside the existing home screen. The existing `/` (offline pass-and-play) is unchanged.
+
+### 14.2 New Zustand store (or context)
+Create `lib/onlineStore.ts` mirroring the shape of `lib/store.ts` but driven by WebSocket events instead of local dispatch:
+
+```typescript
+// Replaces local reducer with WS-driven state
+interface OnlineGameStore extends GameState {
+  roomCode: string | null;
+  myPlayerId: string | null;
+  myRole: "civilian" | "imposter" | null;
+  mySecretWord: string | null;
+  isHost: boolean;
+  connectionStatus: "connecting" | "connected" | "reconnecting" | "disconnected";
+  sendAction: (action: ClientMessage) => void;
+}
+```
+
+### 14.3 WebSocket client
+Create `lib/wsClient.ts`:
+
+```typescript
+class WSClient {
+  connect(roomCode: string, displayName: string): void
+  send(msg: ClientMessage): void
+  on(type: string, handler: (payload: unknown) => void): void
+  off(type: string, handler: Function): void
+  disconnect(): void
+}
+```
+- Handles automatic reconnect with exponential backoff (max 5 retries, 30s cap).
+- Sends `PING` every 25 seconds to keep the connection alive through proxies.
+- Listens for `PONG`; reconnects if no response after 10 seconds.
+
+### 14.4 Timer
+In online mode, the `DiscussionTimer` component reads `endsAt` from the store (set by `DISCUSSION_STARTED`) instead of a local `timerStartedAt`. This keeps all clients in sync.
+
+```typescript
+// Online timer
+const remaining = Math.max(0, Math.floor((endsAt.getTime() - Date.now()) / 1000));
+```
+
+### 14.5 UI additions
+| Screen | Additions |
+|---|---|
+| `/online` landing | "Create Room" button → `POST /api/rooms` → redirect to lobby |
+| Lobby | Room code display with copy button, player list, host badge, timer picker, Start button |
+| Reveal | Each player sees their own reveal without physical phone passing |
+| Voting | Host sees the full active player list with "Eliminate" buttons |
+
+---
+
+## 15. Open Questions
+
+These need product decisions before implementation begins:
+
+| # | Question | Options |
+|---|---|---|
+| 1 | **Reconnect on role reassignment**: if a player rejoins after `GAME_OVER`, do they see the final state or the lobby? | Show final state for 30s, then reset |
+| 2 | **Imposter win on timer expiry**: if the timer runs out and no vote happens, does the imposter win? | Yes (classic social deduction) |
+| 3 | **Kick system**: can the host kick a player from the lobby? | Desirable for v1 |
+| 4 | **Private chat**: do players need any in-app messaging? | Out of scope for v1 |
+| 5 | **Word expansion**: server-managed word list (updatable without redeploy) or compiled-in? | Redis/JSON file for v1.5 |
+| 6 | **Mobile notification on your turn**: push notification when reveal reaches you? | Web Push API, optional |
+| 7 | **CORS in production**: locked to the Next.js app domain or open? | Locked to `ALLOWED_ORIGINS` env var |
+| 8 | **Authentication**: anonymous (display name + UUID) or require accounts? | Anonymous for v1 |
+
+---
+
+## Summary: Sequence Diagram (Happy Path)
+
+```
+Alice (Host)          Bob                Server             Dave
+     │                 │                    │                 │
+     │──POST /api/rooms──────────────────▶│                 │
+     │◀──{roomCode: "XK92PL"}─────────────│                 │
+     │──WS connect──────────────────────▶│                 │
+     │                 │──WS connect──────▶│                 │
+     │                 │                   │──WS connect───▶│
+     │                 │                   │◀─WS connect────│
+     │                 │         ◀─ROOM_STATE (3 players)──┤
+     │──START_GAME──────────────────────▶│                 │
+     │                 │                   │──ROLE_ASSIGNED(civilian, "Elephant")──▶Alice
+     │                 │                   │──ROLE_ASSIGNED(civilian, "Elephant")──▶Bob
+     │                 │                   │──ROLE_ASSIGNED(imposter, null)─────────▶Dave
+     │                 │                   │──REVEAL_TURN (Alice, index 0)──────────▶all
+     │──PLAYER_READY────────────────────▶│                 │
+     │                 │                   │──REVEAL_TURN (Bob, index 1)────────────▶all
+     │                 │──PLAYER_READY────▶│                 │
+     │                 │                   │──REVEAL_TURN (Dave, index 2)───────────▶all
+     │                 │                   │◀─────────────────────PLAYER_READY──────│
+     │                 │                   │──ROOM_STATE (phase: ready)─────────────▶all
+     │──START_DISCUSSION────────────────▶│                 │
+     │                 │                   │──DISCUSSION_STARTED (endsAt: ...)───────▶all
+     │                 │                   │ ... timer runs 5 minutes ...            │
+     │                 │                   │──DISCUSSION_ENDED──────────────────────▶all
+     │──ELIMINATE_PLAYER (Bob)──────────▶│                 │
+     │                 │                   │──PLAYER_ELIMINATED (Bob, civilian)─────▶all
+     │                 │                   │──ROOM_STATE (phase: result)─────────────▶all
+     │──NEXT_ROUND──────────────────────▶│                 │
+     │  ... rounds continue ...           │                 │
+     │──ELIMINATE_PLAYER (Dave)─────────▶│                 │
+     │                 │                   │──GAME_OVER (civilians win, imposter: Dave)▶all
+```
+
+---
+*This spec is intended as the authoritative guide for implementing the Go server. Refer back to `plan.md` for the frontend revamp context and `lib/store.ts` for the offline game state machine that the server mirrors.*
