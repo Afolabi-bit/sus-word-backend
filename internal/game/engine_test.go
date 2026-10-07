@@ -359,3 +359,62 @@ func TestPlayAgain_And_NewGame(t *testing.T) {
 		}
 	}
 }
+
+func TestCastVote_AndTally(t *testing.T) {
+	room, _ := createTestRoom(4)
+	ws := NewWordSelector(nil)
+	_, _ = room.StartGame(ws)
+	for _, pid := range room.RevealOrder {
+		_, _, _ = room.AdvanceReveal(pid)
+	}
+	_, _ = room.StartDiscussion(time.Now())
+	_ = room.EndDiscussion()
+
+	if room.Phase != domain.PhaseVoting {
+		t.Fatalf("expected phase voting, got %s", room.Phase)
+	}
+
+	pids := room.ActivePlayerIDs
+	target := pids[0]
+
+	// Player 1 votes for target
+	allVoted, err := room.CastVote(pids[0], target)
+	if err != nil {
+		t.Fatalf("unexpected vote error: %v", err)
+	}
+	if allVoted {
+		t.Errorf("expected allVoted false after 1 vote")
+	}
+
+	// Player 2 votes for target
+	allVoted, _ = room.CastVote(pids[1], target)
+	if allVoted {
+		t.Errorf("expected allVoted false after 2 votes")
+	}
+
+	// Player 3 votes for target
+	allVoted, _ = room.CastVote(pids[2], target)
+	if allVoted {
+		t.Errorf("expected allVoted false after 3 votes")
+	}
+
+	// Player 4 votes for another player
+	allVoted, err = room.CastVote(pids[3], pids[1])
+	if err != nil {
+		t.Fatalf("unexpected vote error: %v", err)
+	}
+	if !allVoted {
+		t.Errorf("expected allVoted true after 4 votes")
+	}
+
+	winnerID, isTie, tally := room.TallyVotes()
+	if isTie {
+		t.Errorf("expected no tie, got isTie=true")
+	}
+	if winnerID != target {
+		t.Errorf("expected winner %s, got %s", target, winnerID)
+	}
+	if tally[target] != 3 {
+		t.Errorf("expected 3 votes for target, got %d", tally[target])
+	}
+}
