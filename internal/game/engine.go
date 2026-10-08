@@ -26,13 +26,11 @@ const (
 	MaxPlayers = 10
 )
 
-// AllowedTimerDurations defines valid discussion lengths in seconds.
+// AllowedTimerDurations defines valid discussion lengths in seconds (max 5 minutes).
 var AllowedTimerDurations = map[int]bool{
-	60:  true,
-	120: true,
-	180: true,
-	300: true,
-	600: true,
+	120: true, // 2 minutes (120s)
+	180: true, // 3 minutes
+	300: true, // 5 minutes (Maximum)
 }
 
 // NewRoomData initializes a fresh room state.
