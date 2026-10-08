@@ -338,6 +338,9 @@ func (r *Room) handleAction(p *player.Player, env domain.Envelope) {
 	case domain.MsgTypeCastVote:
 		r.handleCastVote(p, env.Payload, reqID)
 
+	case domain.MsgTypeEndVoting:
+		r.handleEndVoting(p, reqID)
+
 	case domain.MsgTypeNextRound:
 		r.handleNextRound(p, reqID)
 
@@ -578,6 +581,22 @@ func (r *Room) handleCastVote(p *player.Player, payloadRaw json.RawMessage, reqI
 	if allVoted {
 		r.finalizeVoting()
 	}
+}
+
+func (r *Room) handleEndVoting(p *player.Player, reqID string) {
+	if !p.IsHost {
+		p.RecordError()
+		r.sendError(p, domain.ErrCodeNotHost, "Only the host can stop voting early", reqID)
+		return
+	}
+	if r.state.Phase != domain.PhaseVoting {
+		p.RecordError()
+		r.sendError(p, domain.ErrCodeInvalidPhase, "Voting can only end from voting phase", reqID)
+		return
+	}
+
+	p.RecordSuccess()
+	r.finalizeVoting()
 }
 
 func (r *Room) finalizeVoting() {
