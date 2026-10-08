@@ -22,6 +22,7 @@ const (
 	MsgTypeEndDiscussion   = "END_DISCUSSION"
 	MsgTypeEliminatePlayer = "ELIMINATE_PLAYER"
 	MsgTypeCastVote        = "CAST_VOTE"
+	MsgTypeEndVoting       = "END_VOTING"
 	MsgTypeNextRound       = "NEXT_ROUND"
 	MsgTypePlayAgain       = "PLAY_AGAIN"
 	MsgTypeNewGame         = "NEW_GAME"
