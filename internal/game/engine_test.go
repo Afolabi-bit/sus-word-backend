@@ -79,8 +79,8 @@ func TestCanStartGame(t *testing.T) {
 func TestSetTimerDuration(t *testing.T) {
 	room, _ := createTestRoom(4)
 
-	// Valid values
-	for _, valid := range []int{60, 120, 180, 300, 600} {
+	// Valid values (120s, 3m, 5m)
+	for _, valid := range []int{120, 180, 300} {
 		if err := room.SetTimerDuration(valid); err != nil {
 			t.Errorf("expected timer %d to be valid, got %v", valid, err)
 		}
@@ -89,9 +89,11 @@ func TestSetTimerDuration(t *testing.T) {
 		}
 	}
 
-	// Invalid value
-	if err := room.SetTimerDuration(45); err == nil {
-		t.Errorf("expected error for timer duration 45")
+	// Invalid values: under minimum (45, 60) or over 5 mins (600)
+	for _, invalid := range []int{45, 60, 600} {
+		if err := room.SetTimerDuration(invalid); err == nil {
+			t.Errorf("expected error for invalid timer duration %d", invalid)
+		}
 	}
 }
 
