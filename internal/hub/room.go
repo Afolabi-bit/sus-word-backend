@@ -130,6 +130,7 @@ func (r *Room) run() {
 	}()
 
 	for ev := range r.inbound {
+		r.mu.Lock()
 		switch ev.eventType {
 		case eventPlayerJoin:
 			r.handleJoin(ev.player, ev.joinResp)
@@ -144,12 +145,15 @@ func (r *Room) run() {
 			r.handleTimerExpired()
 
 		case eventAbandonTimeout:
+			r.mu.Unlock()
 			slog.Info("room abandonment grace period elapsed, closing room", "roomCode", r.Code)
 			return
 
 		case eventStop:
+			r.mu.Unlock()
 			return
 		}
+		r.mu.Unlock()
 	}
 }
 
@@ -418,7 +422,25 @@ func (r *Room) handleStartGame(p *player.Player, reqID string) {
 }
 
 func (r *Room) handlePlayerReady(p *player.Player, reqID string) {
-	allReady, nextPlayer, err := r.state.AdvanceReveal(p.ID)
+	currentPID := ""
+	if r.state.RevealIndex < len(r.state.RevealOrder) {
+		currentPID = r.state.RevealOrder[r.state.RevealIndex]
+	}
+
+	canAdvance := (p.ID == currentPID)
+	if !canAdvance && p.IsHost && currentPID != "" {
+		if curBase, ok := r.state.Players[currentPID]; ok && curBase.DisconnectedAt != nil {
+			canAdvance = true
+		}
+	}
+
+	if !canAdvance {
+		p.RecordError()
+		r.sendError(p, domain.ErrCodeNotYourTurn, "Not your turn in reveal sequence", reqID)
+		return
+	}
+
+	allReady, nextPlayer, err := r.state.AdvanceReveal(currentPID)
 	if err != nil {
 		p.RecordError()
 		r.sendError(p, domain.ErrCodeNotYourTurn, err.Error(), reqID)
@@ -788,6 +810,8 @@ func (r *Room) sendError(p *player.Player, code, message, reqID string) {
 
 // Snapshot returns the current read-only snapshot of room data.
 func (r *Room) Snapshot() domain.PublicRoomState {
+	r.mu.RLock()
+	defer r.mu.RUnlock()
 	return r.state.ToPublic()
 }
 
