@@ -81,12 +81,17 @@ func (r *RoomDataWithState) CanStartGame() error {
 		return fmt.Errorf("%w: current phase is %s", ErrInvalidPhase, r.Phase)
 	}
 
-	count := len(r.Players)
+	count := 0
+	for _, p := range r.Players {
+		if p.DisconnectedAt == nil {
+			count++
+		}
+	}
 	if count < MinPlayers {
-		return fmt.Errorf("%w: currently %d", ErrNotEnoughPlayers, count)
+		return fmt.Errorf("%w: currently %d connected", ErrNotEnoughPlayers, count)
 	}
 	if count > MaxPlayers {
-		return fmt.Errorf("%w: currently %d", ErrTooManyPlayers, count)
+		return fmt.Errorf("%w: currently %d connected", ErrTooManyPlayers, count)
 	}
 
 	return nil
@@ -118,13 +123,20 @@ func (r *RoomDataWithState) StartGame(ws *WordSelector) (map[string]domain.RoleA
 	r.SecretWord = word.Word
 	r.SecretCategory = word.Category
 
-	// 2. Collect connected player IDs and shuffle reveal order
+	// 2. Collect connected player IDs and purge disconnected players
 	playerIDs := make([]string, 0, len(r.Players))
+	newOrder := make([]string, 0, len(r.PlayerOrder))
 	for _, pid := range r.PlayerOrder {
-		if _, ok := r.Players[pid]; ok {
-			playerIDs = append(playerIDs, pid)
+		if p, ok := r.Players[pid]; ok {
+			if p.DisconnectedAt == nil {
+				playerIDs = append(playerIDs, pid)
+				newOrder = append(newOrder, pid)
+			} else {
+				delete(r.Players, pid)
+			}
 		}
 	}
+	r.PlayerOrder = newOrder
 
 	shuffled, err := cryptoShuffle(playerIDs)
 	if err != nil {
@@ -145,7 +157,7 @@ func (r *RoomDataWithState) StartGame(ws *WordSelector) (map[string]domain.RoleA
 	copy(r.ActivePlayerIDs, shuffled)
 
 	for _, p := range r.Players {
-		p.IsActive = true
+		p.IsActive = (p.DisconnectedAt == nil)
 		p.IsReady = false
 	}
 
@@ -153,6 +165,7 @@ func (r *RoomDataWithState) StartGame(ws *WordSelector) (map[string]domain.RoleA
 	r.LastEliminated = nil
 	r.Winner = ""
 	r.Votes = make(map[string]string)
+	r.TimerEndsAt = nil
 	r.Phase = domain.PhaseRevealing
 
 	// 5. Generate private role payloads
@@ -199,6 +212,11 @@ func (r *RoomDataWithState) CurrentRevealPlayer() (*domain.BasePlayer, int, int,
 func (r *RoomDataWithState) AdvanceReveal(playerID string) (allReady bool, nextPlayer *domain.BasePlayer, err error) {
 	if r.Phase != domain.PhaseRevealing {
 		return false, nil, ErrInvalidPhase
+	}
+
+	if r.RevealIndex >= len(r.RevealOrder) {
+		r.Phase = domain.PhaseReady
+		return true, nil, nil
 	}
 
 	currentPID := r.RevealOrder[r.RevealIndex]
@@ -310,11 +328,7 @@ func (r *RoomDataWithState) TallyVotes() (winnerID string, isTie bool, tally map
 		return candidates[0], false, tally
 	}
 
-	// In case of tie or zero votes, isTie is true
-	if len(candidates) > 1 {
-		return candidates[0], true, tally
-	}
-
+	// In case of tie or zero votes, isTie is true and no single winner is chosen
 	return "", true, tally
 }
 
