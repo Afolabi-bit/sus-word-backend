@@ -34,6 +34,7 @@ type PublicRoomState struct {
 	Phase          Phase               `json:"phase"`
 	HostID         string              `json:"hostId"`
 	TimerDuration  int                 `json:"timerDuration"`
+	TimerEndsAt    *time.Time          `json:"timerEndsAt,omitempty"`
 	Players        []PublicPlayer      `json:"players"`
 	ActivePlayers  []string            `json:"activePlayers"`
 	EliminationLog []EliminationRecord `json:"eliminationLog"`
@@ -119,6 +120,7 @@ func (r *RoomData) ToPublic() PublicRoomState {
 		Phase:          r.Phase,
 		HostID:         r.HostID,
 		TimerDuration:  r.TimerDuration,
+		TimerEndsAt:    r.TimerEndsAt,
 		Players:        publicPlayers,
 		ActivePlayers:  activePlayersCopy,
 		EliminationLog: eliminationLogCopy,
