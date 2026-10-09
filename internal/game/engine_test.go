@@ -420,3 +420,92 @@ func TestCastVote_AndTally(t *testing.T) {
 		t.Errorf("expected 3 votes for target, got %d", tally[target])
 	}
 }
+
+func TestTallyVotes_TieNoWinner(t *testing.T) {
+	room, pids := createTestRoom(4)
+	ws := NewWordSelector(nil)
+	_, _ = room.StartGame(ws)
+	for _, pid := range room.RevealOrder {
+		_, _, _ = room.AdvanceReveal(pid)
+	}
+	_, _ = room.StartDiscussion(time.Now())
+	_ = room.EndDiscussion()
+
+	// 2 votes for pids[0], 2 votes for pids[1] -> Tie!
+	_, _ = room.CastVote(pids[0], pids[1])
+	_, _ = room.CastVote(pids[1], pids[0])
+	_, _ = room.CastVote(pids[2], pids[0])
+	_, _ = room.CastVote(pids[3], pids[1])
+
+	winnerID, isTie, tally := room.TallyVotes()
+	if !isTie {
+		t.Errorf("expected isTie to be true on tie vote")
+	}
+	if winnerID != "" {
+		t.Errorf("expected winnerID to be empty on tie vote, got %s", winnerID)
+	}
+	if tally[pids[0]] != 2 || tally[pids[1]] != 2 {
+		t.Errorf("expected 2 votes each, got %v", tally)
+	}
+}
+
+func TestAdvanceReveal_OutOfBoundsSafety(t *testing.T) {
+	room, _ := createTestRoom(4)
+	ws := NewWordSelector(nil)
+	_, _ = room.StartGame(ws)
+
+	// Step through all 4 reveals
+	for _, pid := range room.RevealOrder {
+		allReady, _, err := room.AdvanceReveal(pid)
+		if err != nil {
+			t.Fatalf("unexpected error during reveal: %v", err)
+		}
+		if pid == room.RevealOrder[len(room.RevealOrder)-1] && !allReady {
+			t.Fatalf("expected allReady on last player")
+		}
+	}
+
+	// Now RevealIndex is 4 (out of bounds for slice of len 4).
+	// Calling AdvanceReveal again must NOT panic.
+	allReady, nextP, err := room.AdvanceReveal("any-id")
+	if err == nil && !allReady {
+		t.Errorf("expected allReady or ErrInvalidPhase")
+	}
+	if nextP != nil {
+		t.Errorf("expected nextP to be nil")
+	}
+}
+
+func TestStartGame_ExcludesDisconnectedPlayer(t *testing.T) {
+	room, pids := createTestRoom(5)
+	ws := NewWordSelector(nil)
+
+	// Mark 5th player as disconnected
+	now := time.Now()
+	room.Players[pids[4]].DisconnectedAt = &now
+
+	// Start game: should only include 4 connected players
+	roles, err := room.StartGame(ws)
+	if err != nil {
+		t.Fatalf("unexpected error starting game with 4 connected players: %v", err)
+	}
+
+	if len(roles) != 4 {
+		t.Errorf("expected 4 roles assigned, got %d", len(roles))
+	}
+	if len(room.RevealOrder) != 4 {
+		t.Errorf("expected reveal order of length 4, got %d", len(room.RevealOrder))
+	}
+	if len(room.ActivePlayerIDs) != 4 {
+		t.Errorf("expected 4 active players, got %d", len(room.ActivePlayerIDs))
+	}
+	for _, pid := range room.RevealOrder {
+		if pid == pids[4] {
+			t.Errorf("disconnected player %s should not be in reveal order", pids[4])
+		}
+	}
+	if _, ok := room.Players[pids[4]]; ok {
+		t.Errorf("disconnected player %s should have been purged from room.Players", pids[4])
+	}
+}
+
