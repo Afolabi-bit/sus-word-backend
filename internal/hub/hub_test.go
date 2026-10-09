@@ -163,3 +163,49 @@ func TestRoom_GameFlow_PrivateRoleAssignment(t *testing.T) {
 		t.Errorf("expected 4 active players, got %d", len(snap.ActivePlayers))
 	}
 }
+
+func TestRoom_Snapshot_TimerEndsAt(t *testing.T) {
+	ws := game.NewWordSelector(nil)
+	h := NewHub(10, 30*time.Minute, ws)
+	defer h.Close()
+
+	room, _ := h.CreateRoom("Host")
+	p1 := player.NewPlayer("p-1", "Alice", room.Code, true, nil, room)
+	p2 := player.NewPlayer("p-2", "Bob", room.Code, false, nil, room)
+	p3 := player.NewPlayer("p-3", "Charlie", room.Code, false, nil, room)
+	p4 := player.NewPlayer("p-4", "Dave", room.Code, false, nil, room)
+
+	_ = room.JoinPlayer(p1)
+	_ = room.JoinPlayer(p2)
+	_ = room.JoinPlayer(p3)
+	_ = room.JoinPlayer(p4)
+
+	room.HandleInbound(p1, domain.Envelope{Type: domain.MsgTypeStartGame})
+	time.Sleep(50 * time.Millisecond)
+
+	// Step through all reveals using reveal order
+	for _, pid := range room.state.RevealOrder {
+		var pl *player.Player
+		for _, p := range []*player.Player{p1, p2, p3, p4} {
+			if p.ID == pid {
+				pl = p
+				break
+			}
+		}
+		room.HandleInbound(pl, domain.Envelope{Type: domain.MsgTypePlayerReady})
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	// Host starts discussion
+	room.HandleInbound(p1, domain.Envelope{Type: domain.MsgTypeStartDiscussion})
+	time.Sleep(50 * time.Millisecond)
+
+	snap := room.Snapshot()
+	if snap.Phase != domain.PhaseDiscussing {
+		t.Fatalf("expected phase discussing, got %s", snap.Phase)
+	}
+	if snap.TimerEndsAt == nil {
+		t.Errorf("expected TimerEndsAt to be non-nil in Snapshot during discussion")
+	}
+}
+
